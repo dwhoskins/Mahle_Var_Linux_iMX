@@ -1,1 +1,5 @@
 #include "imx8qxp-var-som-symphony-sd-m4.dts"
+
+/ {
+	model = "Variscite VAR-SOM-MX8X DLX";
+};
