@@ -91,6 +91,7 @@ config IMX_RPMSG_TTY
 	  would be created after this module is insmoded. the demo would be
 	  executed by the command "echo <string> > <accordingly node>", thus
 	  remote M core would receive the string.
+	  
 config IMX_RPMSG_M4
 	tristate "IMX RPMSG M4 driver -- loadable modules only"
 	default m
