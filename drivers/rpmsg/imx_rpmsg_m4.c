@@ -66,6 +66,7 @@ static ssize_t device_read(struct file *fp, char *ch, size_t sz, loff_t *lofft)
 //--------------------------------------------------------------------------------------------------------
 static ssize_t device_write(struct file *fp, const char *ch, size_t sz, loff_t * offset)
 {
+	int err;
 	struct rpmsg_device * rpdev = prpdev_m4;
 	printk("device_write called");
 		
