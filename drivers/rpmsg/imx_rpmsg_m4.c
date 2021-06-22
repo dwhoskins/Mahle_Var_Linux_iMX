@@ -11,22 +11,33 @@
 #include <linux/virtio.h>
 #include <linux/slab.h>
 #include <linux/rpmsg.h>
+#include <linux/list.h>
+#include <linux/semaphore.h>
 
 #define MSG									"Connect"
 #define RPMSG_M4_NUM_DEVICES				1
+#define RX_MSG_BUFFER_COUNT					10
+#define RX_MSG_BUFFER_DATA_SZ				512
 
-
+struct listItemRxMsg
+{
+	int 				iRxDataLen;
+	char * 				pcData;
+	struct list_head 	list;
+};
 
 struct t_stRPMsg_M4
 {
 	struct rpmsg_device *	rpdev;
 	struct cdev 			cdev;
 	struct device 			dev;
+	struct semaphore 		RxCountingSema;
+	spinlock_t				lockFreeBuffers;
+	spinlock_t				lockActiveBuffers;
+	struct list_head 		freeBuffers;
+	struct list_head 		activeBuffers;
+	struct listItemRxMsg * 	alistItemRxMsgs[RX_MSG_BUFFER_COUNT];
 };
-
-
-
-
 
 
 
@@ -43,7 +54,7 @@ dev_t firstDevNo = 0;  // Major device number
 struct class * rpmsg_class;  // class_create will set this
 
 
-char kernelbuff[1024];
+char kernelbuff[512];
 
 
 struct file_operations fops = 
@@ -68,8 +79,6 @@ int device_open(struct inode *inode, struct file *fp)
 	//Set our main driver struct as files private data
 	//This will allow the use of it in later callbacks
 	fp->private_data = pstRPMsg_M4; /* for other methods */
-
-	printk("device_open called");
 	return 0;
 }
 
@@ -78,7 +87,6 @@ static int device_release(struct inode *inode, struct file *fp)
 {
 	struct t_stRPMsg_M4 * pstRPMsg_M4 = fp->private_data;
 	
-	printk("device_release called");
 	return 0;
 }
 
@@ -86,10 +94,37 @@ static int device_release(struct inode *inode, struct file *fp)
 static ssize_t device_read(struct file *fp, char *ch, size_t sz, loff_t *lofft)
 {
 	struct t_stRPMsg_M4 * pstRPMsg_M4 = fp->private_data;
-	
-	printk("device_read called");      
-	copy_to_user(ch, kernelbuff, 1024);
-	return sz;
+	struct listItemRxMsg * plistItemRxMsg = NULL;
+
+	if(down_interruptible(&pstRPMsg_M4->RxCountingSema) == 0)
+	{
+		spin_lock(&pstRPMsg_M4->lockActiveBuffers);
+		if(list_empty(&pstRPMsg_M4->activeBuffers) == false)
+		{
+			plistItemRxMsg = list_first_entry(&pstRPMsg_M4->activeBuffers, struct listItemRxMsg, list);
+			spin_unlock(&pstRPMsg_M4->lockActiveBuffers);
+
+			//TODO
+			//Should check sz before copying
+			copy_to_user(ch, plistItemRxMsg->pcData, plistItemRxMsg->iRxDataLen);
+
+			spin_lock(&pstRPMsg_M4->lockFreeBuffers);
+			list_move_tail(&plistItemRxMsg->list, &pstRPMsg_M4->freeBuffers);
+			spin_unlock(&pstRPMsg_M4->lockFreeBuffers);
+
+			return plistItemRxMsg->iRxDataLen;
+		}
+		else
+		{
+			spin_unlock(&pstRPMsg_M4->lockActiveBuffers);
+			pr_err("device_read: Semphore signaled, but no buffer\n");
+		}
+	}
+	else
+	{
+		pr_err("device_read: Semphore returned non-sucessful \n");
+	}
+	return 0;
 }
 
 //--------------------------------------------------------------------------------------------------------
@@ -97,8 +132,6 @@ static ssize_t device_write(struct file *fp, const char *ch, size_t sz, loff_t *
 {
 	int err;
 	struct t_stRPMsg_M4 * pstRPMsg_M4 = fp->private_data;
-
-	printk("device_write called");
 		
 
 	copy_from_user(kernelbuff, ch, sz);
@@ -119,7 +152,76 @@ static ssize_t device_write(struct file *fp, const char *ch, size_t sz, loff_t *
 //--------------------------------------------------------------------------------------------------------
 static int rpmsg_m4_cb(struct rpmsg_device *rpdev, void *data, int len, void *priv, u32 src)
 {
-	
+	struct t_stRPMsg_M4 * pstRPMsg_M4 = dev_get_drvdata(&rpdev->dev);
+	struct listItemRxMsg * plistItemRxMsg = NULL;
+	int iLenToCopy;
+
+	spin_lock(&pstRPMsg_M4->lockFreeBuffers);
+	if(list_empty(&pstRPMsg_M4->freeBuffers) == true)
+	{
+		spin_unlock(&pstRPMsg_M4->lockFreeBuffers);
+		pr_err("rpmsg_m4: no free Rx Buffers\n");
+		return 0;
+	}
+	else
+	{
+
+		//Get free list item from free list
+		plistItemRxMsg = list_first_entry(&pstRPMsg_M4->freeBuffers, struct listItemRxMsg, list);
+		spin_unlock(&pstRPMsg_M4->lockFreeBuffers);
+
+		if(len > RX_MSG_BUFFER_DATA_SZ)
+		{
+			iLenToCopy = RX_MSG_BUFFER_DATA_SZ;
+		}
+		else
+		{
+			iLenToCopy = len;
+		}
+
+		//Copy message into list item
+		memcpy(plistItemRxMsg->pcData, data, iLenToCopy);
+		plistItemRxMsg->iRxDataLen = iLenToCopy;
+
+
+		//Add list item to active list
+		spin_lock(&pstRPMsg_M4->lockActiveBuffers);
+		list_move_tail(&plistItemRxMsg->list, &pstRPMsg_M4->activeBuffers);
+		spin_unlock(&pstRPMsg_M4->lockActiveBuffers);
+
+		up(&pstRPMsg_M4->RxCountingSema);
+	}
+
+	return 0;
+}
+
+static int rpmsg_m4_init_rx_buffers(struct t_stRPMsg_M4 * pstRPMsg_M4)
+{
+	int iListItemInc = 0;
+
+	INIT_LIST_HEAD(&pstRPMsg_M4->freeBuffers);
+	INIT_LIST_HEAD(&pstRPMsg_M4->activeBuffers);
+
+	for(iListItemInc = 0 ; iListItemInc < RX_MSG_BUFFER_COUNT; iListItemInc ++)
+	{
+		pstRPMsg_M4->alistItemRxMsgs[iListItemInc] = kmalloc(sizeof(struct listItemRxMsg), GFP_KERNEL);
+		INIT_LIST_HEAD(&pstRPMsg_M4->alistItemRxMsgs[iListItemInc]->list);
+		pstRPMsg_M4->alistItemRxMsgs[iListItemInc]->pcData = kzalloc(RX_MSG_BUFFER_DATA_SZ, GFP_KERNEL);
+		list_add(&pstRPMsg_M4->alistItemRxMsgs[iListItemInc]->list, &pstRPMsg_M4->freeBuffers);
+	}
+
+	return 0;
+}
+
+static int rpmsg_m4_release_rx_buffers(struct t_stRPMsg_M4 * pstRPMsg_M4)
+{
+	int iListItemInc = 0;
+
+	for(iListItemInc = 0 ; iListItemInc < RX_MSG_BUFFER_COUNT; iListItemInc ++)
+	{
+		kfree(pstRPMsg_M4->alistItemRxMsgs[iListItemInc]->pcData);
+		kfree(pstRPMsg_M4->alistItemRxMsgs[iListItemInc]);
+	}
 	return 0;
 }
 
@@ -130,6 +232,8 @@ static void rpmsg_m4_release_device(struct device *dev)
 
 	dev_info(&pstRPMsg_M4->rpdev->dev, "rpmsg_m4 release device\n");
 
+	//Release list items and data buffers
+	rpmsg_m4_release_rx_buffers(pstRPMsg_M4);
 	//Delete char device
 	cdev_del(&pstRPMsg_M4->cdev);
 	//Free our driver structure
@@ -146,14 +250,6 @@ static int rpmsg_m4_probe(struct rpmsg_device *rpdev)
 	dev_info(&rpdev->dev, "rpmsg_m4 probe\n");
 
 	dev_info(&rpdev->dev, "new channel: 0x%x -> 0x%x!\n", rpdev->src, rpdev->dst);
-
-	//Notify M4 that driver is loading
-	ret = rpmsg_send(rpdev->ept, MSG, strlen(MSG));
-	if(ret)
-	{
-		dev_err(&rpdev->dev, "rpmsg_send failed: %d\n", ret);
-		return ret;
-	}
 
 	pstRPMsg_M4 = kzalloc(sizeof(*pstRPMsg_M4), GFP_KERNEL);
 	if(!pstRPMsg_M4)
@@ -178,11 +274,20 @@ static int rpmsg_m4_probe(struct rpmsg_device *rpdev)
 	dev_set_name(pDev, "rpmsg_m4");
 	pDev->release = rpmsg_m4_release_device;
 
+	//Init list heads and list items
+	rpmsg_m4_init_rx_buffers(pstRPMsg_M4);
+
+	spin_lock_init(&pstRPMsg_M4->lockFreeBuffers);
+
+	spin_lock_init(&pstRPMsg_M4->lockActiveBuffers);
+
+	sema_init(&pstRPMsg_M4->RxCountingSema, 0);
 
 	ret = device_register(pDev);
 	if(ret != 0)
 	{
 		dev_err(&rpdev->dev, "device_register failed: %d\n", ret);
+		rpmsg_m4_release_rx_buffers(pstRPMsg_M4);
 		put_device(pDev);
 		kfree(pstRPMsg_M4);
 		return ret;
