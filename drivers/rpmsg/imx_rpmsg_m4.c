@@ -16,24 +16,24 @@
 
 #define MSG									"Connect"
 #define RPMSG_M4_NUM_DEVICES				1
-#define RX_MSG_BUFFER_COUNT					10
-#define RX_MSG_BUFFER_DATA_SZ				512
+#define RX_MSG_BUFFER_COUNT				16
+#define RX_MSG_BUFFER_DATA_SZ				8192
 
 struct listItemRxMsg
 {
 	int 				iRxDataLen;
-	char * 				pcData;
-	struct list_head 	list;
+	char * 			pcData;
+	struct list_head 		list;
 };
 
 struct t_stRPMsg_M4
 {
-	struct rpmsg_device *	rpdev;
+	struct rpmsg_device *		rpdev;
 	struct cdev 			cdev;
 	struct device 			dev;
 	struct semaphore 		RxCountingSema;
-	spinlock_t				lockFreeBuffers;
-	spinlock_t				lockActiveBuffers;
+	spinlock_t			lockFreeBuffers;
+	spinlock_t			lockActiveBuffers;
 	struct list_head 		freeBuffers;
 	struct list_head 		activeBuffers;
 	struct listItemRxMsg * 	alistItemRxMsgs[RX_MSG_BUFFER_COUNT];
@@ -54,7 +54,7 @@ dev_t firstDevNo = 0;  // Major device number
 struct class * rpmsg_class;  // class_create will set this
 
 
-char kernelbuff[512];
+char kernelbuff[8192];
 
 
 struct file_operations fops = 
