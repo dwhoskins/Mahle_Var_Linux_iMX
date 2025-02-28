@@ -1,0 +1,187 @@
+From: Gonzalo Ruiz <Gonzalo.Ruiz@digi.com>
+Date: Mon, 24 Feb 2025 09:19:35 +0100
+Subject: [PATCH 1/1] ccimx8x: Set LDO3 to 3V3
+
+Implement and run a SCU api call to enable LDO3 and configure it to
+3.3V. Leave a small delay to allow the voltage to stabilize before using
+the GPIOs.
+
+Also, accept 32b ctrl on misc set/get control. This size is required
+to control the PMIC regulators.
+
+Signed-off-by: Gonzalo Ruiz <Gonzalo.Ruiz@digi.com>
+---
+ arch/arm/include/asm/arch-imx8/sci/sci.h     |   4 +-
+ board/digi/ccimx8x_sbc_pro/ccimx8x_sbc_pro.c | 114 +++++++++++++++++++
+ drivers/misc/imx8/scu_api.c                  |   4 +-
+ 3 files changed, 118 insertions(+), 4 deletions(-)
+
+diff --git a/arch/arm/include/asm/arch-imx8/sci/sci.h b/arch/arm/include/asm/arch-imx8/sci/sci.h
+index bcf5e536aa1..9c5966bc12f 100644
+--- a/arch/arm/include/asm/arch-imx8/sci/sci.h
++++ b/arch/arm/include/asm/arch-imx8/sci/sci.h
+@@ -79,8 +79,8 @@ int sc_pm_resource_reset(sc_ipc_t ipc, sc_rsrc_t resource);
+ 
+ /* MISC API */
+ int sc_misc_set_control(sc_ipc_t ipc, sc_rsrc_t resource,
+-			sc_ctrl_t ctrl, u32 val);
+-int sc_misc_get_control(sc_ipc_t ipc, sc_rsrc_t resource, sc_ctrl_t ctrl,
++			u32 ctrl, u32 val);
++int sc_misc_get_control(sc_ipc_t ipc, sc_rsrc_t resource, u32 ctrl,
+ 			u32 *val);
+ void sc_misc_get_boot_dev(sc_ipc_t ipc, sc_rsrc_t *boot_dev);
+ void sc_misc_boot_status(sc_ipc_t ipc, sc_misc_boot_status_t status);
+diff --git a/board/digi/ccimx8x_sbc_pro/ccimx8x_sbc_pro.c b/board/digi/ccimx8x_sbc_pro/ccimx8x_sbc_pro.c
+index 4b759c4c8b0..0b077e22330 100644
+--- a/board/digi/ccimx8x_sbc_pro/ccimx8x_sbc_pro.c
++++ b/board/digi/ccimx8x_sbc_pro/ccimx8x_sbc_pro.c
+@@ -76,6 +76,115 @@ static iomux_cfg_t const ext_gpios_pads[] = {
+ };
+ #endif /* CONFIG_CONSOLE_ENABLE_GPIO && !CONFIG_SPL_BUILD */
+ 
++/* LDO regulators base addresses */
++#define PF8X00_LDO1_BASE		0x85
++#define PF8X00_LDO2_BASE		0x8b
++#define PF8X00_LDO3_BASE		0x91
++#define PF8X00_LDO4_BASE		0x97
++
++/* Linear regulator macros */
++#define LDOx_CONFIG1(b)			(b)
++#define LDOx_CONFIG2(b)			((b) + 1)
++#define LDOx_PWRUP(b)			((b) + 2)
++#define LDOx_RUN_VOLT(b)		((b) + 3)
++#define LDOx_STBY_VOLT(b)		((b) + 4)
++
++#define LDOx_STBY_EN			BIT(0)
++#define LDOx_RUN_EN			BIT(1)
++#define LDOx_RUN_V_MASK			0x0f
++#define LDOx_STBY_V_MASK		0x0f
++
++/* SCU interface communication macros */
++#define IMX_SC_C_MISC0			62U
++#define IMX_SC_R_PMIC_0			497
++#define PF8X00_SC_C(r)			(IMX_SC_C_MISC0 | (r) << 16)
++
++/* LDO1/2/3/4 - 1.50 to 5.0V (no linear) */
++static const int pf8x00_ldo_volts[] = {
++	1500000, 1600000, 1800000, 1850000,
++	2150000, 2500000, 2800000, 3000000,
++	3100000, 3150000, 3200000, 3300000,
++	3350000, 4000000, 4900000, 5000000,
++};
++
++static int pf8x00_ldo_set_status(int number, bool status)
++{
++	int ldo_reg;
++	u32 value;
++
++	switch (number) {
++		case 1:
++		ldo_reg = PF8X00_SC_C(LDOx_CONFIG2(PF8X00_LDO1_BASE));
++		break;
++		case 2:
++		ldo_reg = PF8X00_SC_C(LDOx_CONFIG2(PF8X00_LDO2_BASE));
++		break;
++		case 3:
++		ldo_reg = PF8X00_SC_C(LDOx_CONFIG2(PF8X00_LDO3_BASE));
++		break;
++		case 4:
++		default:
++		ldo_reg = PF8X00_SC_C(LDOx_CONFIG2(PF8X00_LDO4_BASE));
++		break;
++	}
++
++	if (sc_misc_get_control(-1, IMX_SC_R_PMIC_0, ldo_reg, &value) != SC_ERR_NONE)
++		return 1;
++
++	value &= ~LDOx_RUN_EN;
++	if (status)
++		value |= LDOx_RUN_EN;
++
++	if (sc_misc_set_control(-1, IMX_SC_R_PMIC_0, ldo_reg, value) != SC_ERR_NONE)
++		return 1;
++
++	printf("PMIC:  LDO%u %s\n", number, status ? "enabled" : "disabled");
++	return 0;
++}
++
++static int pf8x00_ldo_set_voltage(int number, int voltage)
++{
++	int ldo_reg;
++	u32 value;
++	int pos = -1;
++
++	switch (number) {
++		case 1:
++		ldo_reg = PF8X00_SC_C(LDOx_RUN_VOLT(PF8X00_LDO1_BASE));
++		break;
++		case 2:
++		ldo_reg = PF8X00_SC_C(LDOx_RUN_VOLT(PF8X00_LDO2_BASE));
++		break;
++		case 3:
++		ldo_reg = PF8X00_SC_C(LDOx_RUN_VOLT(PF8X00_LDO3_BASE));
++		break;
++		case 4:
++		default:
++		ldo_reg = PF8X00_SC_C(LDOx_RUN_VOLT(PF8X00_LDO4_BASE));
++		break;
++	}
++
++	if (sc_misc_get_control(-1, IMX_SC_R_PMIC_0, ldo_reg, &value) != SC_ERR_NONE)
++		return 1;
++
++	for (int i=0; i < ARRAY_SIZE(pf8x00_ldo_volts); i++) {
++		if (pf8x00_ldo_volts[i] == voltage) pos=i;
++	}
++
++	if (pos == -1) {
++		printf("ERROR: wrong voltage set to LDO%u (%u)\n", number, voltage);
++		return 1;
++	}
++
++	value &= ~LDOx_RUN_V_MASK;
++	value |= pos;
++	if (sc_misc_set_control(-1, IMX_SC_R_PMIC_0, ldo_reg, value) != SC_ERR_NONE)
++		return 1;
++
++	printf("PMIC:  LDO%u voltage set to %u microvolts\n", number, voltage);
++	return 0;
++}
++
+ static void setup_iomux_uart(void)
+ {
+ 	imx8_iomux_setup_multiple_pads(uart2_pads, ARRAY_SIZE(uart2_pads));
+@@ -84,6 +193,11 @@ static void setup_iomux_uart(void)
+ int board_early_init_f(void)
+ {
+ 	int ret;
++
++	pf8x00_ldo_set_voltage(3, 3300000);
++	pf8x00_ldo_set_status(3, true);
++	mdelay(20);
++
+ #if defined(CONFIG_CONSOLE_ENABLE_GPIO) && !defined(CONFIG_SPL_BUILD)
+ 	const char *ext_gpios[] = {
+ 		"GPIO4_21",	/* A7 */
+diff --git a/drivers/misc/imx8/scu_api.c b/drivers/misc/imx8/scu_api.c
+index 659eaf7cf0a..38e98eb04b2 100644
+--- a/drivers/misc/imx8/scu_api.c
++++ b/drivers/misc/imx8/scu_api.c
+@@ -254,7 +254,7 @@ int sc_pad_get(sc_ipc_t ipc, sc_pad_t pad, uint32_t *val)
+ 
+ /* MISC */
+ int sc_misc_set_control(sc_ipc_t ipc, sc_rsrc_t resource,
+-			sc_ctrl_t ctrl, u32 val)
++			u32 ctrl, u32 val)
+ {
+ 	struct udevice *dev = gd->arch.scu_dev;
+ 	int size = sizeof(struct sc_rpc_msg_s);
+@@ -280,7 +280,7 @@ int sc_misc_set_control(sc_ipc_t ipc, sc_rsrc_t resource,
+ 	return ret;
+ }
+ 
+-int sc_misc_get_control(sc_ipc_t ipc, sc_rsrc_t resource, sc_ctrl_t ctrl,
++int sc_misc_get_control(sc_ipc_t ipc, sc_rsrc_t resource, u32 ctrl,
+ 			u32 *val)
+ {
+ 	struct udevice *dev = gd->arch.scu_dev;
